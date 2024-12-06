@@ -34,15 +34,35 @@ def parse_args():
 
 @lru_cache(maxsize=None)
 def get_test_dataset():
-    """Get the test dataset (cached to avoid reloading)"""
-    return torchvision.datasets.OxfordIIITPet(
+    """Get the test dataset with original image sizes (cached to avoid reloading)"""
+    dataset = torchvision.datasets.OxfordIIITPet(
         root="oxford_pet_dataset",
         split="test",
         download=True,
         target_types="segmentation",
-        transform=img_transform,
-        target_transform=target_transform
+        transform=None,  # No transform initially to get original size
+        target_transform=None
     )
+
+    # Create a wrapper to store original sizes and apply transforms
+    class DatasetWrapper:
+        def __init__(self, dataset):
+            self.dataset = dataset
+
+        def __getitem__(self, idx):
+            img, mask = self.dataset[idx]
+            original_size = img.size  # Store original size
+
+            # Apply transforms
+            img = img_transform(img)
+            mask = target_transform(mask)
+
+            return img, mask, original_size
+
+        def __len__(self):
+            return len(self.dataset)
+
+    return DatasetWrapper(dataset)
 
 def calculate_iou(pred, target):
     """
@@ -77,8 +97,8 @@ def evaluate_model(model, dataset, device, num_samples):
 
     with torch.no_grad():
         for i in tqdm(range(min(num_samples, len(dataset))), desc="Evaluating"):
-            # Load single image and target
-            image, target = dataset[i]
+            # Load single image and target (ignore original_size for evaluation)
+            image, target, _ = dataset[i]
             image = image.unsqueeze(0).to(device)  # Add batch dimension
             target = target.to(device)
 
@@ -95,37 +115,39 @@ def evaluate_model(model, dataset, device, num_samples):
 def visualize_predictions(model, dataset, device, num_samples=3, params_str=''):
     """
     Visualize model predictions and save them with IoU scores.
-
-    Args:
-        model: The trained model
-        dataset: Test dataset
-        device: torch device
-        num_samples: Number of samples to visualize
-        params_str: String describing the hyperparameters for filename
+    Predictions are resized back to original image dimensions.
     """
     model.eval()
     plt.figure(figsize=(5, num_samples * 5))
 
     with torch.no_grad():
         for i in range(num_samples):
-            # Load image and ground truth
-            image, gt = dataset[i]
+            # Load image, ground truth, and original size
+            image, gt, original_size = dataset[i]
             image = image.unsqueeze(0).to(device)
 
             # Get prediction
             output = model(image)['out']
             pred = output.argmax(dim=1).cpu().squeeze()
 
+            # Resize prediction back to original dimensions
+            pred = transforms.ToPILImage()(pred.unsqueeze(0).float())
+            pred = transforms.Resize(original_size[::-1], interpolation=transforms.InterpolationMode.NEAREST)(pred)
+            pred = torch.tensor(np.array(pred), dtype=torch.bool)
+
+            # Resize ground truth back to original dimensions
+            gt = transforms.ToPILImage()(gt.unsqueeze(0).float())
+            gt = transforms.Resize(original_size[::-1], interpolation=transforms.InterpolationMode.NEAREST)(gt)
+            gt = torch.tensor(np.array(gt), dtype=torch.bool)
+
             # Calculate IoU
-            gt = gt.bool()
-            pred = pred.bool()
             iou = calculate_iou(pred, gt)
 
             # Plot prediction
             plt.subplot(num_samples, 1, i + 1)
             plt.imshow(pred.numpy(), cmap='gray')
             plt.axis('off')
-            plt.title(f"Model Prediction\nIoU: {iou:.3f}")
+            plt.title(f"Model Prediction (Original Size: {original_size})\nIoU: {iou:.3f}")
 
     plt.tight_layout()
     # Create filename from hyperparameters
@@ -184,6 +206,11 @@ def main(args):
         'momentum': [0.9, 0.95],
         'batch_size': [4, 8]
     }
+    param_grid = {
+        'learning_rate': [0.01],
+        'momentum': [0.9],
+        'batch_size': [4]
+    }
 
     # Get datasets
     train_dataset = torchvision.datasets.OxfordIIITPet(
@@ -210,7 +237,7 @@ def main(args):
         }
 
         # Initialize model
-        model = torchvision.models.segmentation.fcn_resnet50(pretrained=False, weights=None)
+        model = torchvision.models.segmentation.fcn_resnet50(weights=None, weights_backbone=None)
         model.classifier[4] = nn.Conv2d(512, 2, kernel_size=1)
         model.to(device)
 

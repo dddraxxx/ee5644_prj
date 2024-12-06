@@ -1,0 +1,2 @@
+learning_rate,momentum,batch_size,iou_score
+0.01,0.9,4,0.5097798846662045
